@@ -24,7 +24,7 @@ class HFDataClient:
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "HFDL-Tournament-Backtester/3.5"})
+        self.session.headers.update({"User-Agent": "HFDL-Tournament-Backtester/3.6"})
 
     def request_safe(
         self,
@@ -246,7 +246,7 @@ def prepare_and_audit_data(
 
 
 # =====================================================================
-# 3. ADVANCED INDICATOR PRECOMPUTATION (INCLUDES CAPITULATION & PULLBACKS)
+# 3. ADVANCED INDICATOR PRECOMPUTATION
 # =====================================================================
 def precompute_indicators(df: pd.DataFrame, x_lookback: int = 10, orb_minutes: int = 15) -> pd.DataFrame:
     df = df.copy()
@@ -275,15 +275,12 @@ def precompute_indicators(df: pd.DataFrame, x_lookback: int = 10, orb_minutes: i
     df["donchian_high_x"] = g["high"].transform(lambda s: s.shift(1).rolling(x_lookback, min_periods=3).max())
     df["donchian_low_x"] = g["low"].transform(lambda s: s.shift(1).rolling(x_lookback, min_periods=3).min())
 
-    # Multi-timeframe trend & capitulation proxies
     df["sma50"] = g["close"].transform(lambda s: s.rolling(50, min_periods=10).mean())
     df["sma200"] = g["close"].transform(lambda s: s.rolling(200, min_periods=20).mean())
     
-    # 12-Month / Rolling 252-session equivalent low capitulation proxy
     rolling_min_252 = g["low"].transform(lambda s: s.rolling(252, min_periods=20).min())
     df["near_capitulation_low"] = df["low"] <= (rolling_min_252 * 1.015)
 
-    # Lower-high pullback constraint: price pulled back from a recent local high while remaining above major trend
     recent_high_20 = g["high"].transform(lambda s: s.rolling(20, min_periods=5).max())
     df["pulled_back_from_high"] = (df["close"] < recent_high_20 * 0.985) & (df["close"] > df["sma50"])
 
@@ -313,6 +310,12 @@ def precompute_indicators(df: pd.DataFrame, x_lookback: int = 10, orb_minutes: i
     orb_h = orb_slice.groupby("session_date")["high"].max().rename("orb_high")
     orb_l = orb_slice.groupby("session_date")["low"].min().rename("orb_low")
     df = df.join(orb_h, on="session_date").join(orb_l, on="session_date")
+
+    # Opening Range Drive / Return calculation for Strategy #15
+    first_open = g["open"].transform("first")
+    orb_close_map = orb_slice.groupby("session_date")["close"].last().rename("orb_close")
+    df = df.join(orb_close_map, on="session_date")
+    df["open_drive_ret"] = (df["orb_close"] / first_open) - 1.0
 
     df["bar_time"] = df.index.strftime("%H:%M")
     df["orb_end_time"] = orb_end
@@ -474,7 +477,7 @@ def simulate_round_trip_trades(
 
 
 # =====================================================================
-# 4. THE 15 STRATEGIES (INCLUDING CAPITULATION & PULLBACK MODELS)
+# 4. THE 15 STRATEGIES
 # =====================================================================
 def run_all_15_strategies(
     df_ind: pd.DataFrame,
@@ -507,408 +510,4 @@ def run_all_15_strategies(
         {
             "name": f"4. Opening Range Breakout ({orb_minutes}m) + Session VWAP Trend",
             "rule": f"LONG ENTRY: After {orb_minutes}m, Close > ORB High & VWAP & Volume > 1.25x MA. EXIT: Cross back through VWAP.",
-            "l_ent": ((df_ind["bar_time"] > df_ind["orb_end_time"]) & (df_ind["close"] > df_ind["orb_high"]) & (df_ind["close"] > df_ind["vwap"]) & (df_ind["volume"] > 1.25 * df_ind["vol_ma20"])).to_numpy(),
-            "l_ext": (df_ind["close"] < df_ind["vwap"]).to_numpy(),
-            "s_ent": ((df_ind["bar_time"] > df_ind["orb_end_time"]) & (df_ind["close"] < df_ind["orb_low"]) & (df_ind["close"] < df_ind["vwap"]) & (df_ind["volume"] > 1.25 * df_ind["vol_ma20"])).to_numpy(),
-            "s_ext": (df_ind["close"] > df_ind["vwap"]).to_numpy(),
-        },
-        {
-            "name": "5. Session VWAP 2-SD Mean Reversion Band Bounce",
-            "rule": "LONG ENTRY: Close < VWAP - 2.0 SD. SHORT ENTRY: Close > VWAP + 2.0 SD. EXIT: Touch VWAP.",
-            "l_ent": (df_ind["close"] < (df_ind["vwap"] - 2.0 * df_ind["vwap_std"])).to_numpy(),
-            "l_ext": (df_ind["close"] >= df_ind["vwap"]).to_numpy(),
-            "s_ent": (df_ind["close"] > (df_ind["vwap"] + 2.0 * df_ind["vwap_std"])).to_numpy(),
-            "s_ext": (df_ind["close"] <= df_ind["vwap"]).to_numpy(),
-        },
-        {
-            "name": f"6. Connors Intraday RSI(2) < 5 Dip Buyer -> {x_lookback}-Bar High Exit",
-            "rule": f"ENTRY: RSI(2) < 5 while above VWAP -> buy Next Open. EXIT: RSI(2) > 70 or Highest Close of prior {x_lookback} bars.",
-            "l_ent": ((df_ind["rsi2"] < 5.0) & (df_ind["close"] > df_ind["vwap"])).to_numpy(),
-            "l_ext": ((df_ind["rsi2"] > 70.0) | (df_ind["close"] >= df_ind["highest_close_x"])).to_numpy(),
-        },
-        {
-            "name": f"7. Donchian Channel ({x_lookback}-Bar) Volatility Breakout",
-            "rule": f"LONG ENTRY: Close > prior {x_lookback}-bar Highest High on Volume > 1.2x MA. EXIT: Close < Lowest Close.",
-            "l_ent": ((df_ind["close"] > df_ind["donchian_high_x"]) & (df_ind["volume"] > 1.2 * df_ind["vol_ma20"])).to_numpy(),
-            "l_ext": (df_ind["close"] < df_ind["lowest_close_x"]).to_numpy(),
-        },
-        {
-            "name": "8. Intraday Internal Bar Strength (IBS < 0.10) Pullback",
-            "rule": "ENTRY: IBS < 0.10 (close in bottom 10% of range) while above 20 SMA -> buy Next Open. EXIT: Close > prior bar High.",
-            "l_ent": ((df_ind["ibs"] < 0.10) & (df_ind["close"] > df_ind["sma20"])).to_numpy(),
-            "l_ext": (df_ind["close"] > df_ind["prev_high"]).to_numpy(),
-        },
-        {
-            "name": "9. Bollinger Band (20, 2) Squeeze & Volume Expansion",
-            "rule": "LONG ENTRY: Close breaks Upper BB on Volume > 1.5x MA. EXIT: Close < 20 SMA.",
-            "l_ent": ((df_ind["close"] > (df_ind["sma20"] + 2.0 * df_ind["std20"])) & (df_ind["volume"] > 1.5 * df_ind["vol_ma20"])).to_numpy(),
-            "l_ext": (df_ind["close"] < df_ind["sma20"]).to_numpy(),
-        },
-        {
-            "name": "10. EMA(9/21) Momentum Cross + VWAP Confirmation",
-            "rule": "LONG ENTRY: 9 EMA crosses above 21 EMA while Close > VWAP. SHORT ENTRY: 9 EMA crosses below 21 EMA while Close < VWAP.",
-            "l_ent": ((df_ind["ema9"] > df_ind["ema21"]) & (df_ind["prev_ema9"] <= df_ind["prev_ema21"]) & (df_ind["close"] > df_ind["vwap"])).to_numpy(),
-            "l_ext": (df_ind["ema9"] < df_ind["ema21"]).to_numpy(),
-            "s_ent": ((df_ind["ema9"] < df_ind["ema21"]) & (df_ind["prev_ema9"] >= df_ind["prev_ema21"]) & (df_ind["close"] < df_ind["vwap"])).to_numpy(),
-            "s_ext": (df_ind["ema9"] > df_ind["ema21"]).to_numpy(),
-        },
-        # --- NEW ADVANCED STRATEGIES INCORPORATED FROM RECENT WORKFLOWS ---
-        {
-            "name": "11. 12-Month Low Capitulation Mean-Reversion Bounce",
-            "rule": "ENTRY: Price touches rolling 12-month low capitulation zone (within 1.5% of 252-session low) with RSI(2) < 10 -> buy Next Open. EXIT: Revert to 20 SMA or 15:55 ET.",
-            "l_ent": (df_ind["near_capitulation_low"] & (df_ind["rsi2"] < 10.0)).to_numpy(),
-            "l_ext": (df_ind["close"] >= df_ind["sma20"]).to_numpy(),
-        },
-        {
-            "name": "12. Multi-Timeframe Trend + Lower-High Pullback Entry",
-            "rule": "ENTRY: Price pulls back from 20-bar local high while remaining above 50 SMA (uptrend filter) and RSI(2) < 15 -> buy Next Open. EXIT: Close > recent local high or 15:55 ET.",
-            "l_ent": (df_ind["pulled_back_from_high"] & (df_ind["rsi2"] < 15.0)).to_numpy(),
-            "l_ext": (df_ind["close"] >= df_ind["highest_close_x"]).to_numpy(),
-        },
-        {
-            "name": "13. 200-SMA Macro Trend Filter + Intraday VWAP Dip Buyer",
-            "rule": "ENTRY: Close > 200-bar SMA (macro bull trend) and Close drops below Session VWAP - 1.0 SD -> buy Next Open. EXIT: Touch VWAP + 0.5 SD or 15:55 ET.",
-            "l_ent": ((df_ind["close"] > df_ind["sma200"]) & (df_ind["close"] < df_ind["vwap"] - 1.0 * df_ind["vwap_std"])).to_numpy(),
-            "l_ext": (df_ind["close"] >= df_ind["vwap"] + 0.5 * df_ind["vwap_std"]).to_numpy(),
-        },
-        {
-            "name": "14. Volume Shock Spike (3x Volume MA) Breakout",
-            "rule": "ENTRY: Intraday bar volume spikes to > 3.0x 20-bar volume MA and Close > prior bar High -> buy Next Open. EXIT: Close < 9 EMA or 15:55 ET.",
-            "l_ent": ((df_ind["volume"] > 3.0 * df_ind["vol_ma20"]) & (df_ind["close"] > df_ind["prev_high"])).to_numpy(),
-            "l_ext": (df_ind["close"] < df_ind["ema9"]).to_numpy(),
-        },
-        {
-            "name": "15. Opening Drive Momentum Continuation (First 15m > 1%)",
-            "rule": "ENTRY: Opening 15-minute drive return > +1.0% and Close > VWAP at bar 16 -> buy Next Open. EXIT: Close crosses below VWAP or 15:55 ET.",
-            "l_ent": ((df_ind["bar_time"] == (pd.Timestamp("2000-01-01 09:30:00") + pd.Timedelta(minutes=orb_minutes)).strftime("%H:%M")) & (df_ind["open_drive_ret"] > 0.01) & (df_ind["close"] > df_ind["vwap"])).to_numpy(),
-            "l_ext": (df_ind["close"] < df_ind["vwap"]).to_numpy(),
-        },
-    ]
-
-    rows = []
-    eq_curves = {}
-
-    for spec in strategies_spec:
-        s_ent = spec.get("s_ent", None)
-        s_ext = spec.get("s_ext", None)
-        eq, m = simulate_round_trip_trades(
-            df_ind,
-            long_entry=spec["l_ent"],
-            long_exit=spec["l_ext"],
-            short_entry=s_ent,
-            short_exit=s_ext,
-            base_capital=base_capital,
-            commission_per_order=commission,
-        )
-        if m:
-            row = {"Strategy": spec["name"], "Rule Tooltip": spec["rule"]}
-            row.update(m)
-            rows.append(row)
-            eq_curves[spec["name"]] = eq
-
-    res_df = pd.DataFrame(rows)
-    if not res_df.empty:
-        res_df = res_df.sort_values(by="Annualized Return (%)", ascending=False).reset_index(drop=True)
-        res_df.index = res_df.index + 1
-        res_df.index.name = "Rank"
-
-    return res_df, eq_curves
-
-
-# =====================================================================
-# 5. HTML TOURNAMENT TABLE WITH HOVER TOOLTIPS & GREEN/RED HIGHLIGHTING
-# =====================================================================
-def render_tournament_html_table(df: pd.DataFrame) -> str:
-    best_idx = df["Annualized Return (%)"].idxmax()
-    worst_idx = df["Annualized Return (%)"].idxmin()
-
-    display_cols = [
-        "Strategy",
-        "Annualized Return (%)",
-        "Total Net Return (%)",
-        "Ending Equity ($)",
-        "Sharpe Ratio",
-        "Max Drawdown (%)",
-        "Trade Win Rate (%)",
-        "Profit Factor",
-        "Round-Trip Trades",
-    ]
-
-    css = """
-    <style>
-    .tourn-wrap {
-        overflow-x: auto;
-        margin-top: 8px;
-        margin-bottom: 18px;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    }
-    table.tourn-table {
-        width: 100%;
-        border-collapse: collapse;
-        font-size: 14px;
-        border: 1px solid #d0d7de;
-        border-radius: 8px;
-    }
-    table.tourn-table th {
-        background-color: #1f2937;
-        color: #ffffff;
-        padding: 10px 12px;
-        text-align: right;
-        font-weight: 600;
-        border-bottom: 2px solid #374151;
-    }
-    table.tourn-table th:first-child,
-    table.tourn-table th:nth-child(2) {
-        text-align: left;
-    }
-    table.tourn-table td {
-        padding: 10px 12px;
-        border-bottom: 1px solid #e5e7eb;
-        text-align: right;
-        color: #111827;
-    }
-    table.tourn-table td:first-child,
-    table.tourn-table td:nth-child(2) {
-        text-align: left;
-        font-weight: 600;
-    }
-    tr.row-normal {
-        background-color: #ffffff;
-        transition: background-color 0.15s ease;
-    }
-    tr.row-normal:hover {
-        background-color: #f3f4f6;
-    }
-    tr.row-best {
-        background-color: #d1fae5 !important;
-        border-left: 5px solid #059669;
-    }
-    tr.row-best td {
-        color: #065f46 !important;
-        font-weight: 700;
-    }
-    tr.row-worst {
-        background-color: #fee2e2 !important;
-        border-left: 5px solid #dc2626;
-    }
-    tr.row-worst td {
-        color: #991b1b !important;
-        font-weight: 700;
-    }
-    .strat-tooltip {
-        position: relative;
-        display: inline-block;
-        cursor: help;
-        border-bottom: 1px dashed #6b7280;
-    }
-    .strat-tooltip .tooltiptext {
-        visibility: hidden;
-        width: 420px;
-        background-color: #111827;
-        color: #f9fafb;
-        text-align: left;
-        border-radius: 6px;
-        padding: 10px 12px;
-        position: absolute;
-        z-index: 9999;
-        top: 125%;
-        left: 0;
-        opacity: 0;
-        transition: opacity 0.18s ease-in-out;
-        font-weight: 400;
-        font-size: 13px;
-        line-height: 1.45;
-        box-shadow: 0 10px 15px -3px rgba(0,0,0,0.3);
-        pointer-events: none;
-    }
-    .strat-tooltip:hover .tooltiptext {
-        visibility: visible;
-        opacity: 1;
-    }
-    </style>
-    """
-
-    html_out = [css, '<div class="tourn-wrap"><table class="tourn-table"><thead><tr><th>Rank</th>']
-    for col in display_cols:
-        html_out.append(f"<th>{html.escape(col)}</th>")
-    html_out.append("</tr></thead><tbody>")
-
-    for rank_idx, row in df.iterrows():
-        if rank_idx == best_idx:
-            row_cls = "row-best"
-            badge = "🏆 "
-        elif rank_idx == worst_idx:
-            row_cls = "row-worst"
-            badge = "⚠️ "
-        else:
-            row_cls = "row-normal"
-            badge = ""
-
-        rule_escaped = html.escape(str(row["Rule Tooltip"]))
-        strat_escaped = html.escape(str(row["Strategy"]))
-
-        html_out.append(f'<tr class="{row_cls}" title="{rule_escaped}">')
-        html_out.append(f"<td>#{rank_idx}</td>")
-        html_out.append(
-            f'<td><div class="strat-tooltip">{badge}{strat_escaped}'
-            f'<span class="tooltiptext"><strong>Strategy Rules:</strong><br>{rule_escaped}</span>'
-            f"</div></td>"
-        )
-        html_out.append(f'<td>{row["Annualized Return (%)"]:+.2f}%</td>')
-        html_out.append(f'<td>{row["Total Net Return (%)"]:+.2f}%</td>')
-        html_out.append(f'<td>${row["Ending Equity ($)"]:,.2f}</td>')
-        html_out.append(f'<td>{row["Sharpe Ratio"]:.2f}</td>')
-        html_out.append(f'<td>{row["Max Drawdown (%)"]:.2f}%</td>')
-        html_out.append(f'<td>{row["Trade Win Rate (%)"]:.1f}%</td>')
-        html_out.append(f'<td>{row["Profit Factor"]:.2f}</td>')
-        html_out.append(f'<td>{int(row["Round-Trip Trades"]):,}</td>')
-        html_out.append("</tr>")
-
-    html_out.append("</tbody></table></div>")
-    return "".join(html_out)
-
-
-# =====================================================================
-# 6. SIDEBAR CONTROLS & EXECUTION
-# =====================================================================
-default_key = ""
-try:
-    if "HFDL_API_KEY" in st.secrets:
-        default_key = st.secrets["HFDL_API_KEY"]
-except Exception:
-    pass
-if not default_key:
-    default_key = os.environ.get("HFDL_API_KEY", "")
-
-with st.sidebar:
-    st.header("1. API Key Setup")
-    api_key = st.text_input(
-        "Paste X-API-Key",
-        value=default_key,
-        type="password",
-        placeholder="Enter your HF Data Library key...",
-    )
-
-    st.header("2. Market & Data Integrity")
-    pub_client = HFDataClient(api_key="")
-    symbols_df, sym_err = pub_client.list_symbols()
-    tickers = symbols_df["ticker"].tolist() if not symbols_df.empty else ["AAPL", "NVDA", "MSFT", "SPY", "TSLA"]
-    default_idx = tickers.index("AAPL") if "AAPL" in tickers else 0
-
-    ticker = st.selectbox("Ticker", options=tickers, index=default_idx)
-    timeframe = st.selectbox("Timeframe", options=["1min", "5min", "15min", "30min"], index=0)
-    version = st.selectbox("Data Version", options=["clean", "raw"], index=0)
-
-    min_completeness = st.slider(
-        "Minimum Session Completeness (%)",
-        min_value=50.0,
-        max_value=100.0,
-        value=95.0,
-        step=1.0,
-        help="Keeps normal trading days while dropping broken or half-day sessions.",
-    )
-    ffill_quiet = st.checkbox(
-        "Forward-Fill Quiet 0-Volume Minutes",
-        value=True,
-        help="Pads quiet minutes with prior close and Volume=0 to keep rolling indicators aligned.",
-    )
-
-    st.header("3. Tournament Parameters")
-    start_date = st.date_input("Start Date", value=pd.to_datetime("2018-01-02"))
-    end_date = st.date_input("End Date", value=pd.to_datetime("2026-10-10"))
-    x_lookback = st.slider("Prior X-Bars Lookback", 3, 50, 10, 1)
-    orb_minutes = st.slider("Opening Range Window (mins)", 5, 60, 15, 5)
-    base_capital = st.number_input("Position Size ($ Cap)", 1000.0, 20000.0, 1000.0)
-    commission = st.number_input("Commission ($ / order)", 0.0, 1.0, 0.25)
-
-    run_btn = st.button("🚀 Run 15-Strategy Tournament", type="primary", use_container_width=True)
-
-if sym_err:
-    st.error(f"**Public Endpoint Error:** {sym_err}")
-else:
-    st.caption(f"✅ Connected to `api.hfdatalibrary.com` — {len(tickers)} tickers available.")
-
-if not api_key or api_key == "your-key-here":
-    st.info("👈 Paste your **HF Data Library `X-API-Key`** in the left sidebar and click **Run 15-Strategy Tournament**.")
-    st.stop()
-
-if run_btn:
-    client = HFDataClient(api_key=api_key)
-
-    with st.status("Running API Verification, Missing-Data Audit & 15-Strategy Tournament...", expanded=True) as status:
-        ok, auth_msg = client.test_auth(ticker)
-        if not ok:
-            status.update(label="API Key Verification Failed", state="error")
-            st.error(f"**API Diagnostic Result:**\n\n`{auth_msg}`")
-            st.stop()
-        st.write(f"✅ {auth_msg}")
-
-        status.update(label=f"Downloading/Loading {ticker} ({timeframe}, {version}) Parquet...", state="running")
-        bars_df, dl_err = client.get_bars(ticker, timeframe=timeframe, version=version)
-        if dl_err or bars_df is None:
-            status.update(label="Download Failed", state="error")
-            st.error(f"**Download Error:** `{dl_err}`")
-            st.stop()
-
-        status.update(label="Auditing time series for missing intraday bars...", state="running")
-        clean_df, audit_info, flagged_df = prepare_and_audit_data(
-            bars_df,
-            timeframe=timeframe,
-            start_date=str(start_date),
-            end_date=str(end_date),
-            min_completeness_pct=min_completeness,
-            ffill_quiet_minutes=ffill_quiet,
-        )
-
-        if clean_df.empty:
-            status.update(label="No Valid Trading Sessions Found", state="error")
-            st.warning("No valid sessions remained. Lower the 'Minimum Session Completeness (%)' slider.")
-            st.stop()
-
-        status.update(label="Computing indicators & simulating 15 intraday strategies...", state="running")
-        df_ind = precompute_indicators(clean_df, x_lookback=x_lookback, orb_minutes=orb_minutes)
-        tourn_df, eq_curves = run_all_15_strategies(
-            df_ind,
-            x_lookback=x_lookback,
-            orb_minutes=orb_minutes,
-            base_capital=base_capital,
-            commission=commission,
-        )
-        status.update(label="Tournament Complete!", state="complete", expanded=False)
-
-    st.subheader(f"🗓️ Data Coverage & Missing-Bar Integrity Check — {ticker} ({timeframe})")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Backtest Data Begins (ET)", audit_info["bt_first_ts"])
-    c2.metric("Backtest Data Ends (ET)", audit_info["bt_last_ts"])
-    c3.metric(
-        "Sessions Tested / Total Found",
-        f"{audit_info['sessions_tested']:,} / {audit_info['total_sessions_found']:,}",
-        delta=f"{audit_info['calendar_years']} Calendar Yrs ({audit_info['dropped_sessions']} low-coverage days omitted)",
-    )
-    c4.metric("Quiet/Missing Bars Detected", f"{audit_info['total_missing_bars']:,}")
-
-    st.caption(
-        f"**Full Ticker Archive Range on Server:** Begins `{audit_info['raw_first_ts']}` and ends `{audit_info['raw_last_ts']}` | "
-        f"**Calendar Span Tested:** `{audit_info['calendar_years']} years` | "
-        f"**NaN Rows Cleaned:** `{audit_info['nan_rows_removed']}`"
-    )
-
-    if not flagged_df.empty:
-        with st.expander(f"🔍 Inspect {len(flagged_df)} Omitted Sessions Below {min_completeness:.0f}% Bar Completeness"):
-            st.dataframe(flagged_df, use_container_width=True)
-
-    st.subheader("🏆 15-Strategy Intraday Tournament Results")
-    st.caption(
-        "💡 **Hover your mouse over any Strategy name** to view its exact entry and exit rules. "
-        "The **#1 Best Strategy is highlighted Green**, and the **#15 Worst Strategy is highlighted Red**. "
-        f"All entries/exits execute at **Next Bar's Open** with a **${base_capital:,.0f}** non-compounding cap "
-        f"and **${commission:.2f}** order commission (**${commission * 2:.2f}** per round trip)."
-    )
-
-    html_table = render_tournament_html_table(tourn_df)
-    st.markdown(html_table, unsafe_allow_html=True)
-
-    st.subheader("📊 Strategy Equity Curves ($ Account Value)")
-    if eq_curves:
-        eq_df = pd.DataFrame(eq_curves)
-        st.line_chart(eq_df)
+            "l_ent": ((df_ind["bar_time"] > df_ind["orb_end_time"]) & (df_ind["close"] > df_ind["orb_high"]) & (df_ind["close"] > df_ind["vw
