@@ -9,8 +9,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="HF Data Library — Semi-HFT QQQ & VXX Tournament", layout="wide")
-st.title("⚡ Semi-High-Frequency Intraday Strategy Tournament (QQQ & VXX)")
+st.set_page_config(page_title="HF Data Library — 15-Strategy Semi-HFT Tournament", layout="wide")
+st.title("📈 HF Data Library — 15-Strategy Semi-HFT Tournament & Data Audit")
 
 
 # =====================================================================
@@ -24,7 +24,7 @@ class HFDataClient:
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "HFDL-SemiHFT-Tournament/4.0"})
+        self.session.headers.update({"User-Agent": "HFDL-SemiHFT-Tournament/5.0"})
 
     def request_safe(
         self,
@@ -122,9 +122,25 @@ class HFDataClient:
 
 
 # =====================================================================
-# 2. DATA PREPARATION & FEATURE ENGINEERING
+# 2. DATA VALIDATOR & MISSING-BAR INTEGRITY AUDIT
 # =====================================================================
-def prepare_semi_hft_features(df_raw: pd.DataFrame, start_date: str, end_date: str, is_vxx: bool = False) -> pd.DataFrame:
+EXPECTED_BARS_PER_DAY = {
+    "1min": 390,
+    "5min": 78,
+    "15min": 26,
+    "30min": 13,
+}
+
+
+def prepare_and_audit_data(
+    df_raw: pd.DataFrame,
+    timeframe: str,
+    start_date: str,
+    end_date: str,
+    min_completeness_pct: float = 95.0,
+    ffill_quiet_minutes: bool = True,
+    is_vxx: bool = False,
+) -> Tuple[pd.DataFrame, Dict, pd.DataFrame]:
     df = df_raw.copy()
 
     if not isinstance(df.index, pd.DatetimeIndex):
@@ -141,62 +157,132 @@ def prepare_semi_hft_features(df_raw: pd.DataFrame, start_date: str, end_date: s
     if df.index.tz is not None:
         df.index = df.index.tz_convert("America/New_York").tz_localize(None)
 
+    raw_first_ts = df.index.min() if not df.empty else None
+    raw_last_ts = df.index.max() if not df.empty else None
+
     df = df.loc[str(start_date):str(end_date)]
-    df = df.between_time("09:30", "16:00").copy()
+    df = df.between_time("09:30", "15:59").copy()
 
     if df.empty:
-        return df
+        return df, {}, pd.DataFrame()
 
-    df["date"] = df.index.date
-    df["time"] = df.index.strftime("%H:%M")
-    df["year"] = df.index.year
+    if is_vxx and "2024-08-05" in df.index.strftime("%Y-%m-%d"):
+        df = df[df.index.strftime("%Y-%m-%d") != "2024-08-05"].copy()
 
-    if is_vxx:
-        df = df[df["date"] != pd.to_datetime("2024-08-05").date()].copy()
+    ohlc_cols = [c for c in ["open", "high", "low", "close", "volume"] if c in df.columns]
+    nan_rows_count = int(df[ohlc_cols].isna().any(axis=1).sum())
+    if nan_rows_count > 0:
+        df = df.dropna(subset=ohlc_cols)
 
-    # Session VWAP
+    df["session_date"] = df.index.normalize()
+    expected_bars = EXPECTED_BARS_PER_DAY.get(timeframe, 390)
+    pd_freq = {"1min": "1min", "5min": "5min", "15min": "15min", "30min": "30min"}.get(timeframe, "1min")
+
+    counts = df.groupby("session_date").size().rename("Observed Bars")
+    first_bars = df.groupby("session_date").apply(lambda g: g.index.min().strftime("%H:%M")).rename("First Bar (ET)")
+    last_bars = df.groupby("session_date").apply(lambda g: g.index.max().strftime("%H:%M")).rename("Last Bar (ET)")
+
+    audit_df = pd.concat([first_bars, last_bars, counts], axis=1).reset_index()
+    audit_df["Session Date"] = audit_df["session_date"].dt.strftime("%Y-%m-%d")
+    audit_df["Expected Bars"] = expected_bars
+    audit_df["Missing Bars"] = (expected_bars - audit_df["Observed Bars"]).clip(lower=0)
+    audit_df["Completeness (%)"] = ((audit_df["Observed Bars"] / expected_bars) * 100.0).round(1)
+    audit_df["Meets Threshold"] = audit_df["Completeness (%)"] >= min_completeness_pct
+
+    total_sessions_found = len(audit_df)
+    flagged_df = audit_df[~audit_df["Meets Threshold"]].copy()
+    total_missing_bars = int(audit_df["Missing Bars"].sum())
+
+    valid_session_dates = audit_df.loc[audit_df["Meets Threshold"], "session_date"]
+    df = df[df["session_date"].isin(valid_session_dates)].copy()
+
+    if not df.empty and ffill_quiet_minutes:
+        unique_days = df["session_date"].unique()
+        intraday_offsets = pd.timedelta_range(start="09:30:00", end="15:59:00", freq=pd_freq)
+        full_idx = pd.DatetimeIndex(np.add.outer(unique_days, intraday_offsets).ravel())
+        df = df.reindex(full_idx)
+        df["session_date"] = df.index.normalize()
+        df["close"] = df.groupby("session_date")["close"].ffill().bfill()
+        for col in ["open", "high", "low"]:
+            df[col] = df[col].fillna(df["close"])
+        df["volume"] = df["volume"].fillna(0.0)
+
+    bt_first_ts = df.index.min() if not df.empty else None
+    bt_last_ts = df.index.max() if not df.empty else None
+    cal_years = max((bt_last_ts - bt_first_ts).days / 365.25, 1.0 / 252.0) if (bt_first_ts and bt_last_ts) else 0.0
+
+    audit_summary = {
+        "raw_first_ts": raw_first_ts.strftime("%Y-%m-%d %H:%M:%S ET") if raw_first_ts is not None else "N/A",
+        "raw_last_ts": raw_last_ts.strftime("%Y-%m-%d %H:%M:%S ET") if raw_last_ts is not None else "N/A",
+        "bt_first_ts": bt_first_ts.strftime("%Y-%m-%d %H:%M:%S ET") if bt_first_ts is not None else "N/A",
+        "bt_last_ts": bt_last_ts.strftime("%Y-%m-%d %H:%M:%S ET") if bt_last_ts is not None else "N/A",
+        "calendar_years": round(cal_years, 2),
+        "total_sessions_found": total_sessions_found,
+        "sessions_tested": int(df["session_date"].nunique()) if not df.empty else 0,
+        "dropped_sessions": len(flagged_df),
+        "total_missing_bars": total_missing_bars,
+        "nan_rows_removed": nan_rows_count,
+    }
+
+    display_cols = [
+        "Session Date", "First Bar (ET)", "Last Bar (ET)",
+        "Observed Bars", "Expected Bars", "Missing Bars", "Completeness (%)", "Meets Threshold"
+    ]
+    return df, audit_summary, flagged_df[display_cols] if not flagged_df.empty else pd.DataFrame()
+
+
+# =====================================================================
+# 3. SEMI-HFT & INTRADAY FEATURE PRECOMPUTATION
+# =====================================================================
+def precompute_indicators(df: pd.DataFrame, x_lookback: int = 10, orb_minutes: int = 15) -> pd.DataFrame:
+    df = df.copy()
+    g = df.groupby("session_date")
+
     tp = (df["high"] + df["low"] + df["close"]) / 3.0
     pv = tp * df["volume"]
-    cum_pv = pv.groupby(df["date"]).cumsum()
-    cum_vol = df["volume"].groupby(df["date"]).cumsum().replace(0, np.nan)
-    df["vwap"] = cum_pv / cum_vol
+    cum_pv = pv.groupby(df["session_date"]).cumsum()
+    cum_vol = g["volume"].cumsum().replace(0, np.nan)
+    df["vwap"] = (cum_pv / cum_vol).groupby(df["session_date"]).ffill().fillna(df["close"])
 
-    # Intraday returns & Z-score
-    df["ret_1m"] = df.groupby("date")["close"].pct_change(1)
-    df["ret_2m"] = df.groupby("date")["close"].pct_change(2)
-    df["ret_3m"] = df.groupby("date")["close"].pct_change(3)
-    df["ret_15m"] = df.groupby("date")["close"].pct_change(15)
+    # Returns & Z-Score
+    df["ret_1m"] = g["close"].pct_change(1)
+    df["ret_2m"] = g["close"].pct_change(2)
+    df["ret_3m"] = g["close"].pct_change(3)
+    df["ret_15m"] = g["close"].pct_change(15)
 
-    g = df.groupby("date")["close"]
-    df["ma_15"] = g.transform(lambda x: x.rolling(15, min_periods=10).mean())
-    df["std_15"] = g.transform(lambda x: x.rolling(15, min_periods=10).std())
+    df["ma_15"] = g["close"].transform(lambda x: x.rolling(15, min_periods=10).mean())
+    df["std_15"] = g["close"].transform(lambda x: x.rolling(15, min_periods=10).std())
     df["z_15"] = (df["close"] - df["ma_15"]) / df["std_15"].replace(0, np.nan)
 
-    df["day_open"] = df.groupby("date")["open"].transform("first")
+    df["day_open"] = g["open"].transform("first")
     df["ret_from_open"] = (df["close"] - df["day_open"]) / df["day_open"]
 
     rng = (df["high"] - df["low"]).replace(0, np.nan)
     df["ibs"] = (df["close"] - df["low"]) / rng
 
-    # 15-min Opening Range
-    or15 = df[df["time"] <= "09:44"].groupby("date").agg(
-        or15_high=("high", "max"),
-        or15_low=("low", "min")
-    )
-    df["or15_high"] = df["date"].map(or15["or15_high"])
-    df["or15_low"] = df["date"].map(or15["or15_low"])
+    # Opening Range High / Low (15m and 30m)
+    orb_end = (pd.Timestamp("2000-01-01 09:30:00") + pd.Timedelta(minutes=orb_minutes)).strftime("%H:%M")
+    orb_slice = df.between_time("09:30", orb_end)
+    orb_h = orb_slice.groupby("session_date")["high"].max().rename("or15_high")
+    orb_l = orb_slice.groupby("session_date")["low"].min().rename("or15_low")
+    df = df.join(orb_h, on="session_date").join(orb_l, on="session_date")
 
-    # 30-min Opening Range for breakdown filtering
-    or30 = df[df["time"] <= "09:59"].groupby("date").agg(
-        or30_low=("low", "min"),
-        or30_close=("close", "last")
-    )
-    df["or30_low"] = df["date"].map(or30["or30_low"])
-    df["or30_ret"] = (df["date"].map(or30["or30_close"]) - df["day_open"]) / df["day_open"]
+    or30_slice = df.between_time("09:30", "09:59")
+    or30_l = or30_slice.groupby("session_date")["low"].min().rename("or30_low")
+    or30_c = or30_slice.groupby("session_date")["close"].last().rename("or30_close")
+    df = df.join(or30_l, on="session_date").join(or30_c, on="session_date")
+    df["or30_ret"] = (df["or30_close"] - df["day_open"]) / df["day_open"]
 
-    # Consecutive 1-min Up/Down Streaks
+    # Consecutive Up/Down Streaks
+    prev_close = g["close"].shift(1)
+    is_lower = df["close"] < prev_close
+    is_higher = df["close"] > prev_close
+    df["down_5_streak"] = is_lower.groupby(df["session_date"]).transform(lambda s: s.rolling(5, min_periods=5).sum() == 5)
+    df["down_3_streak"] = is_lower.groupby(df["session_date"]).transform(lambda s: s.rolling(3, min_periods=3).sum() == 3)
+    df["up_5_streak"] = is_higher.groupby(df["session_date"]).transform(lambda s: s.rolling(5, min_periods=5).sum() == 5)
+
     dirs = np.where(df["ret_1m"] > 0, 1, np.where(df["ret_1m"] < 0, -1, 0))
-    dates = df["date"].values
+    dates = df["session_date"].values
     u_st, d_st = np.zeros(len(df), dtype=int), np.zeros(len(df), dtype=int)
     cu, cd = 0, 0
     for i in range(len(df)):
@@ -211,246 +297,227 @@ def prepare_semi_hft_features(df_raw: pd.DataFrame, start_date: str, end_date: s
         u_st[i] = cu; d_st[i] = cd
     df["u_streak"] = u_st
     df["d_streak"] = d_st
+
+    df["highest_close_x"] = g["close"].transform(lambda s: s.rolling(x_lookback, min_periods=2).max())
+    df["vol_ma20"] = g["volume"].transform(lambda s: s.rolling(20, min_periods=5).mean())
+    df["bar_time"] = df.index.strftime("%H:%M")
     return df
 
 
-# =====================================================================
-# 3. SEMI-HFT BACKTESTING ENGINE ($20K SIZE, $1 COMM, BAR-CLOSE EXEC)
-# =====================================================================
-def run_semi_hft_engine(
+def simulate_round_trip_trades(
     df: pd.DataFrame,
-    ticker: str,
-    long_sig: pd.Series,
-    short_sig: pd.Series,
-    exit_l: pd.Series,
-    exit_s: pd.Series,
-    max_hold_bars: int,
-    stop_loss_pct: float,
-    profit_target_pct: float,
-    fixed_trade_size: float = 20000.0,
-    commission_per_trade: float = 1.0,
-) -> pd.DataFrame:
-    trades = []
-    dates = df["date"].values
-    years = df["year"].values
-    times = df.index.strftime("%Y-%m-%d %H:%M:%S").values
-    time_strs = df["time"].values
-    closes = df["close"].values
-    l_arr, s_arr = long_sig.values, short_sig.values
-    el_arr, es_arr = exit_l.values, exit_s.values
-
+    long_entry: np.ndarray,
+    long_exit: np.ndarray,
+    short_entry: Optional[np.ndarray] = None,
+    short_exit: Optional[np.ndarray] = None,
+    max_hold_bars: int = 120,
+    stop_loss_pct: float = 0.008,
+    profit_target_pct: float = 0.0075,
+    base_capital: float = 20000.0,
+    commission_per_order: float = 1.0,
+) -> Tuple[pd.Series, Dict[str, float]]:
     n = len(df)
-    in_pos = 0
-    entry_px, entry_idx, entry_time, shares = 0.0, 0, None, 0
+    if short_entry is None:
+        short_entry = np.zeros(n, dtype=bool)
+    if short_exit is None:
+        short_exit = np.zeros(n, dtype=bool)
 
-    for i in range(n):
-        is_eod = (i == n - 1) or (dates[i+1] != dates[i]) or (time_strs[i] >= "15:58")
-        if in_pos != 0:
+    opens = df["open"].to_numpy(dtype=np.float64)
+    closes = df["close"].to_numpy(dtype=np.float64)
+    session_dates = df["session_date"].to_numpy()
+    bar_times = df["bar_time"].to_numpy()
+
+    can_enter = (bar_times >= "09:45") & (bar_times <= "15:40")
+    eod_flat_signal = bar_times >= "15:54"
+
+    l_ent = long_entry & can_enter
+    s_ent = short_entry & can_enter
+    l_ext = long_exit | eod_flat_signal
+    s_ext = short_exit | eod_flat_signal
+
+    equity = base_capital
+    peak_equity = base_capital
+    max_dd_pct = 0.0
+
+    trade_pnls = []
+    daily_pnl_map = {}
+    for s_dt in pd.unique(session_dates):
+        daily_pnl_map[pd.Timestamp(s_dt)] = 0.0
+
+    pos = 0
+    entry_price = 0.0
+    entry_idx = 0
+    pos_dollars = 0.0
+
+    for i in range(n - 1):
+        curr_session = session_dates[i]
+        next_session = session_dates[i + 1]
+        is_last_bar_of_session = curr_session != next_session
+
+        if pos != 0:
             bars_held = i - entry_idx
             cur_px = closes[i]
-            ret = (cur_px - entry_px) / entry_px if in_pos == 1 else (entry_px - cur_px) / entry_px
+            ret = (cur_px - entry_price) / entry_price if pos == 1 else (entry_price - cur_px) / entry_price
+
             reason = None
-            if is_eod:
-                reason = "EOD Close"
+            if is_last_bar_of_session or eod_flat_signal[i]:
+                reason = "EOD"
             elif ret <= -stop_loss_pct:
-                reason = "Stop Loss"
+                reason = "SL"
             elif ret >= profit_target_pct:
-                reason = "Profit Target"
-            elif (in_pos == 1 and el_arr[i]) or (in_pos == -1 and es_arr[i]):
-                reason = "Regime Reversal"
+                reason = "PT"
+            elif (pos == 1 and l_ext[i]) or (pos == -1 and s_ext[i]):
+                reason = "Signal"
             elif bars_held >= max_hold_bars:
-                reason = f"Time Exit ({max_hold_bars}m)"
+                reason = "Time"
 
             if reason is not None:
-                gross = (cur_px - entry_px) * shares if in_pos == 1 else (entry_px - cur_px) * shares
-                trades.append({
-                    "Ticker": ticker,
-                    "Date": dates[i],
-                    "Year": years[i],
-                    "Entry Time": entry_time,
-                    "Exit Time": times[i],
-                    "Direction": "LONG" if in_pos == 1 else "SHORT",
-                    "Shares": shares,
-                    "Entry Price": round(entry_px, 3),
-                    "Exit Price": round(cur_px, 3),
-                    "Bars Held": bars_held,
-                    "Exit Reason": reason,
-                    "Gross PnL ($)": round(gross, 2),
-                    "Net PnL ($)": round(gross - commission_per_trade, 2)
-                })
-                in_pos = 0
+                net_pnl = (pos_dollars * ret) - (2.0 * commission_per_order)
+                equity += net_pnl
+                trade_pnls.append(net_pnl)
+                daily_pnl_map[pd.Timestamp(curr_session)] += net_pnl
 
-        if in_pos == 0 and not is_eod and ("09:45" <= time_strs[i] <= "15:40"):
-            if l_arr[i]:
-                in_pos = 1
-                entry_px = closes[i]
-                entry_idx = i
-                entry_time = times[i]
-                shares = max(1, int(round(fixed_trade_size / entry_px)))
-            elif s_arr[i]:
-                in_pos = -1
-                entry_px = closes[i]
-                entry_idx = i
-                entry_time = times[i]
-                shares = max(1, int(round(fixed_trade_size / entry_px)))
-    return pd.DataFrame(trades)
+                if equity > peak_equity:
+                    peak_equity = equity
+                dd = ((equity - peak_equity) / peak_equity) * 100.0 if peak_equity > 0 else 0.0
+                if dd < max_dd_pct:
+                    max_dd_pct = dd
+                pos = 0
+                continue
 
+        if pos == 0 and not is_last_bar_of_session and equity > 0:
+            if l_ent[i]:
+                pos = 1
+                entry_price = opens[i + 1]
+                entry_idx = i + 1
+                pos_dollars = min(base_capital, max(equity, 0.0))
+            elif s_ent[i]:
+                pos = -1
+                entry_price = opens[i + 1]
+                entry_idx = i + 1
+                pos_dollars = min(base_capital, max(equity, 0.0))
 
-# =====================================================================
-# 4. STREAMLIT UI & STRATEGY SELECTION
-# =====================================================================
-default_key = ""
-try:
-    if "HFDL_API_KEY" in st.secrets:
-        default_key = st.secrets["HFDL_API_KEY"]
-except Exception:
-    pass
-if not default_key:
-    default_key = os.environ.get("HFDL_API_KEY", "")
+    daily_pnl_series = pd.Series(daily_pnl_map).sort_index()
+    eq_series = base_capital + daily_pnl_series.cumsum()
 
-with st.sidebar:
-    st.header("1. API Key Setup")
-    api_key = st.text_input("Paste X-API-Key", value=default_key, type="password")
+    full_eq = pd.concat([pd.Series([base_capital]), eq_series])
+    eod_peaks = full_eq.cummax()
+    eod_dd = float((((full_eq - eod_peaks) / eod_peaks) * 100.0).min())
+    max_dd_pct = min(max_dd_pct, eod_dd)
 
-    st.header("2. Market & Parameters")
-    pub_client = HFDataClient(api_key="")
-    symbols_df, sym_err = pub_client.list_symbols()
-    tickers = symbols_df["ticker"].tolist() if not symbols_df.empty else ["QQQ", "VXX", "AAPL", "SPY"]
-    default_idx = tickers.index("QQQ") if "QQQ" in tickers else 0
+    cal_years = max((daily_pnl_series.index[-1] - daily_pnl_series.index[0]).days / 365.25, 1.0 / 12.0) if len(daily_pnl_series) >= 2 else 1.0
+    total_ret_pct = ((equity - base_capital) / base_capital) * 100.0
+    ann_ret_pct = total_ret_pct / cal_years
 
-    ticker = st.selectbox("Ticker", options=tickers, index=default_idx)
-    version = st.selectbox("Version", options=["clean", "raw"], index=0)
+    daily_rets_on_base = daily_pnl_series / base_capital
+    std_d = daily_rets_on_base.std()
+    sharpe = float((daily_rets_on_base.mean() / std_d) * np.sqrt(252.0)) if std_d > 0 else 0.0
 
-    fixed_trade_size = st.number_input("Fixed Trade Size ($)", value=20000.0, step=1000.0)
-    commission = st.number_input("Commission per Trade ($)", value=1.0, step=0.25)
-
-    st.header("3. Strategy Configuration")
-    strategy_mode = st.selectbox(
-        "Strategy Engine",
-        options=[
-            "QQQ Multi-Signal Engine (Long + Short, 120m Hold)",
-            "QQQ Active 45m Scalper (Long + Short)",
-            "QQQ Core Sub-Signal 1 Only (VWAP + 3-Bar Dip Long)",
-            "VXX Volatility Crush & Cascade Engine"
-        ]
-    )
-
-    start_date = st.date_input("Start Date", value=pd.to_datetime("2022-03-07"))
-    end_date = st.date_input("End Date", value=pd.to_datetime("2026-10-30"))
-
-    run_btn = st.button("🚀 Run Semi-HFT Backtest", type="primary", use_container_width=True)
-
-if sym_err:
-    st.error(f"**Public Endpoint Error:** {sym_err}")
-
-if not api_key or api_key == "your-key-here":
-    st.info("👈 Paste your **HF Data Library `X-API-Key`** in the left sidebar and click **Run Semi-HFT Backtest**.")
-    st.stop()
-
-if run_btn:
-    client = HFDataClient(api_key=api_key)
-
-    with st.status(f"Downloading and backtesting {ticker}...", expanded=True) as status:
-        ok, auth_msg = client.test_auth(ticker)
-        if not ok:
-            status.update(label="API Key Verification Failed", state="error")
-            st.error(auth_msg)
-            st.stop()
-
-        bars_df, dl_err = client.get_bars(ticker, timeframe="1min", version=version)
-        if dl_err or bars_df is None:
-            status.update(label="Download Failed", state="error")
-            st.error(dl_err)
-            st.stop()
-
-        is_vxx = "VXX" in ticker.upper()
-        df_feat = prepare_semi_hft_features(bars_df, str(start_date), str(end_date), is_vxx=is_vxx)
-
-        if df_feat.empty:
-            status.update(label="No data in range", state="error")
-            st.warning("No data found for the selected date range.")
-            st.stop()
-
-        # Define signal arrays based on strategy mode
-        if is_vxx or "VXX" in strategy_mode:
-            max_hold = 90
-            pt = 0.015
-            sl = 0.014
-            l_sig = (
-                (df_feat["time"] >= "09:45") & (df_feat["time"] <= "15:00") &
-                (df_feat["close"] > df_feat["vwap"]) & (df_feat["close"] > df_feat["or15_high"]) &
-                (df_feat["ret_from_open"] >= 0.0120) & (df_feat["ret_15m"] >= 0.0080) & (df_feat["ret_2m"] <= -0.0010)
-            )
-            s_sig = (
-                (df_feat["time"] >= "09:45") & (df_feat["time"] <= "15:35") & (
-                    ((df_feat["close"] < df_feat["vwap"]) & (df_feat["close"] < df_feat["or15_low"]) & (df_feat["ret_from_open"] <= -0.0050) & (df_feat["ret_2m"] >= 0.0010)) |
-                    ((df_feat["close"] < df_feat["vwap"]) & (df_feat["ret_from_open"] <= -0.0060) & (df_feat["ret_15m"] <= -0.0080) & (df_feat["ret_1m"] >= 0.0)) |
-                    ((df_feat["ret_from_open"] <= -0.0020) & (df_feat["z_15"] >= 1.8) & (df_feat["ibs"] >= 0.75))
-                )
-            )
-            ex_l = (df_feat["close"] < df_feat["vwap"] * 0.995)
-            ex_s = (df_feat["close"] > df_feat["vwap"] * 1.005) & (df_feat["ret_15m"] > 0.0060)
-        else:
-            if "Core Sub-Signal 1" in strategy_mode:
-                max_hold = 120
-                pt = 0.0075
-                sl = 0.0080
-                l_sig = (df_feat["close"] > df_feat["vwap"]) & (df_feat["ret_from_open"] >= 0.0015) & ((df_feat["d_streak"] >= 3) | ((df_feat["ret_3m"] <= -0.0010) & (df_feat["ibs"] <= 0.15)))
-                s_sig = pd.Series(False, index=df_feat.index)
-            elif "45m" in strategy_mode:
-                max_hold = 45
-                pt = 0.0045
-                sl = 0.0055
-                l_sig = (
-                    ((df_feat["close"] > df_feat["vwap"]) & (df_feat["ret_from_open"] >= 0.0020) & (df_feat["ret_15m"] >= 0.0015) & (df_feat["ret_2m"] <= -0.0004) & (df_feat["ibs"] <= 0.25)) |
-                    ((df_feat["close"] > df_feat["vwap"]) & (df_feat["close"] > df_feat["or15_high"]) & (df_feat["ret_15m"] >= 0.0040) & (df_feat["ret_1m"] <= 0.0)) |
-                    ((df_feat["time"] >= "11:00") & (df_feat["ret_from_open"] >= -0.0030) & (df_feat["z_15"] <= -2.2) & (df_feat["ibs"] <= 0.05))
-                )
-                s_sig = (df_feat["close"] < df_feat["vwap"]) & (df_feat["close"] < df_feat["or15_low"]) & (df_feat["ret_from_open"] <= -0.0040) & (df_feat["ret_15m"] <= -0.0020) & (df_feat["ret_2m"] >= 0.0004) & (df_feat["ibs"] >= 0.75)
-            else:
-                max_hold = 120
-                pt = 0.0075
-                sl = 0.0080
-                l_sig = (
-                    ((df_feat["close"] > df_feat["vwap"]) & (df_feat["ret_from_open"] >= 0.0015) & ((df_feat["d_streak"] >= 3) | ((df_feat["ret_3m"] <= -0.0010) & (df_feat["ibs"] <= 0.15)))) |
-                    ((df_feat["close"] > df_feat["or15_high"]) & (df_feat["close"] > df_feat["vwap"]) & (df_feat["ret_15m"] >= 0.0025) & (df_feat["d_streak"] >= 1) & (df_feat["ibs"] <= 0.25)) |
-                    ((df_feat["d_streak"] >= 4) & (df_feat["ibs"] <= 0.05) & (df_feat["ret_from_open"] >= -0.0040))
-                )
-                s_sig = (df_feat["close"] < df_feat["vwap"]) & (df_feat["close"] < df_feat["or15_low"]) & (df_feat["ret_from_open"] <= -0.0035) & (df_feat["ret_15m"] <= -0.0015) & (df_feat["u_streak"] >= 2) & (df_feat["ibs"] >= 0.80)
-
-            ex_l = (df_feat["close"] < df_feat["vwap"] * 0.9970) & (df_feat["ret_15m"] <= -0.0035)
-            ex_s = (df_feat["close"] > df_feat["vwap"] * 1.0030) & (df_feat["ret_15m"] >= 0.0035)
-
-        trades_df = run_semi_hft_engine(
-            df_feat, ticker, l_sig, s_sig, ex_l, ex_s,
-            max_hold_bars=max_hold, stop_loss_pct=sl, profit_target_pct=pt,
-            fixed_trade_size=fixed_trade_size, commission_per_trade=commission
-        )
-        status.update(label="Backtest Complete!", state="complete", expanded=False)
-
-    if trades_df.empty:
-        st.warning("No trades generated with the current strategy parameters and date filter.")
+    trades_arr = np.array(trade_pnls, dtype=np.float64)
+    n_trades = len(trades_arr)
+    if n_trades > 0:
+        wins = trades_arr[trades_arr > 0]
+        losses = trades_arr[trades_arr < 0]
+        win_rate = (len(wins) / n_trades) * 100.0
+        gross_win = float(wins.sum()) if len(wins) > 0 else 0.0
+        gross_loss = float(abs(losses.sum())) if len(losses) > 0 else 0.0
+        pf = (gross_win / gross_loss) if gross_loss > 0 else (99.9 if gross_win > 0 else 0.0)
     else:
-        trades_df["Cumulative Net PnL ($)"] = trades_df["Net PnL ($)"].cumsum()
+        win_rate = 0.0
+        pf = 0.0
 
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Total Net PnL", f"${trades_df['Net PnL ($)'].sum():,.2f}")
-        col2.metric("Total Trades", f"{len(trades_df):,}")
-        col3.metric("Win Rate", f"{(trades_df['Net PnL ($)'] > 0).mean()*100:.2f}%")
-        col4.metric("Total Commissions Paid", f"${len(trades_df)*commission:,.2f}")
+    metrics = {
+        "Annualized Return (%)": round(ann_ret_pct, 2),
+        "Total Net Return (%)": round(total_ret_pct, 2),
+        "Ending Equity ($)": round(equity, 2),
+        "Sharpe Ratio": round(sharpe, 2),
+        "Max Drawdown (%)": round(max_dd_pct, 2),
+        "Trade Win Rate (%)": round(win_rate, 1),
+        "Profit Factor": round(min(pf, 99.9), 2),
+        "Round-Trip Trades": int(n_trades),
+    }
+    return eq_series, metrics
 
-        st.subheader("📅 Annualized Performance Breakdown")
-        ann = trades_df.groupby("Year").agg(
-            Trades=("Net PnL ($)", "count"),
-            Win_Rate=("Net PnL ($)", lambda x: f"{(x > 0).mean()*100:.2f}%"),
-            Gross_PnL=("Gross PnL ($)", lambda x: f"${x.sum():,.2f}"),
-            Net_PnL=("Net PnL ($)", lambda x: f"${x.sum():,.2f}"),
-            Return_on_Allocation=("Net PnL ($)", lambda x: f"{(x.sum() / fixed_trade_size)*100:+.2f}%")
-        ).reset_index()
-        st.dataframe(ann, use_container_width=True)
 
-        st.subheader("📈 Cumulative Net PnL Curve")
-        st.line_chart(trades_df.set_index("Exit Time")["Cumulative Net PnL ($)"])
-
-        st.subheader("📋 Master Trade Log")
-        st.dataframe(trades_df, use_container_width=True)
+# =====================================================================
+# 4. THE 15 STRATEGIES (INCLUDING SEMI-HFT QQQ & VXX MODELS)
+# =====================================================================
+def run_all_15_strategies(
+    df_ind: pd.DataFrame,
+    base_capital: float = 20000.0,
+    commission: float = 1.0,
+) -> Tuple[pd.DataFrame, Dict[str, pd.Series]]:
+    strategies_spec = [
+        {
+            "name": "1. QQQ Semi-HFT Multi-Signal Engine (Long + Short)",
+            "rule": "ENTRY L: VWAP Trend + 3-bar dip OR OR15 Breakout + micro-rest OR 4-bar down exhaustion. ENTRY S: OR30 Breakdown + 2-bar pop rejection. Exit: PT +0.75%, SL -0.80%, 120m max hold.",
+            "l_ent": (
+                ((df_ind["close"] > df_ind["vwap"]) & (df_ind["ret_from_open"] >= 0.0015) & ((df_ind["down_3_streak"]) | ((df_ind["ret_3m"] <= -0.0010) & (df_ind["ibs"] <= 0.15)))) |
+                ((df_ind["close"] > df_ind["or15_high"]) & (df_ind["close"] > df_ind["vwap"]) & (df_ind["ret_15m"] >= 0.0025) & (df_ind["ibs"] <= 0.25)) |
+                ((df_ind["down_5_streak"]) & (df_ind["ibs"] <= 0.05) & (df_ind["ret_from_open"] >= -0.0040))
+            ).to_numpy(),
+            "l_ext": ((df_ind["close"] < df_ind["vwap"] * 0.9970) & (df_ind["ret_15m"] <= -0.0035)).to_numpy(),
+            "s_ent": ((df_ind["close"] < df_ind["vwap"]) & (df_ind["close"] < df_ind["or30_low"]) & (df_ind["or30_ret"] <= -0.0015) & (df_ind["u_streak"] >= 2) & (df_ind["ibs"] >= 0.80)).to_numpy(),
+            "s_ext": ((df_ind["close"] > df_ind["vwap"] * 1.0030) & (df_ind["ret_15m"] >= 0.0035)).to_numpy(),
+            "max_hold": 120, "sl": 0.0080, "pt": 0.0075,
+        },
+        {
+            "name": "2. QQQ Active 45m Scalper (Long + Short)",
+            "rule": "ENTRY L: VWAP Trend + 0.2% open ret + 2-min dip OR OR15 breakout. ENTRY S: VWAP Breakdown + OR30 low break. PT +0.45%, SL -0.55%, 45m hold.",
+            "l_ent": (
+                ((df_ind["close"] > df_ind["vwap"]) & (df_ind["ret_from_open"] >= 0.0020) & (df_ind["ret_15m"] >= 0.0015) & (df_ind["ret_2m"] <= -0.0004) & (df_ind["ibs"] <= 0.25)) |
+                ((df_ind["close"] > df_ind["vwap"]) & (df_ind["close"] > df_ind["or15_high"]) & (df_ind["ret_15m"] >= 0.0040))
+            ).to_numpy(),
+            "l_ext": ((df_ind["close"] < df_ind["vwap"] * 0.9970)).to_numpy(),
+            "s_ent": ((df_ind["close"] < df_ind["vwap"]) & (df_ind["close"] < df_ind["or15_low"]) & (df_ind["ret_from_open"] <= -0.0040) & (df_ind["ibs"] >= 0.75)).to_numpy(),
+            "s_ext": ((df_ind["close"] > df_ind["vwap"] * 1.0030)).to_numpy(),
+            "max_hold": 45, "sl": 0.0055, "pt": 0.0045,
+        },
+        {
+            "name": "3. QQQ Core Sub-Signal 1 Only (VWAP + 3-Bar Dip Long)",
+            "rule": "LONG ENTRY: Close > VWAP, Return from open >= +0.15%, and 3 consecutive down closes or 3m return <= -0.10% with IBS <= 0.15. PT +0.75%, SL -0.80%.",
+            "l_ent": ((df_ind["close"] > df_ind["vwap"]) & (df_ind["ret_from_open"] >= 0.0015) & ((df_ind["down_3_streak"]) | ((df_ind["ret_3m"] <= -0.0010) & (df_ind["ibs"] <= 0.15)))).to_numpy(),
+            "l_ext": ((df_ind["close"] < df_ind["vwap"] * 0.9970)).to_numpy(),
+            "max_hold": 120, "sl": 0.0080, "pt": 0.0075,
+        },
+        {
+            "name": "4. VXX Volatility Crush & Cascade Engine",
+            "rule": "LONG ENTRY: Volatility breakout ignition. SHORT ENTRY: OR15/VWAP breakdown + bounce fade or Z-score pop >= 1.8. PT +1.50%, SL -1.40%, 90m hold.",
+            "l_ent": ((df_ind["close"] > df_ind["vwap"]) & (df_ind["close"] > df_ind["or15_high"]) & (df_ind["ret_from_open"] >= 0.0120) & (df_ind["ret_15m"] >= 0.0080) & (df_ind["ret_2m"] <= -0.0010)).to_numpy(),
+            "l_ext": ((df_ind["close"] < df_ind["vwap"] * 0.995)).to_numpy(),
+            "s_ent": (
+                ((df_ind["close"] < df_ind["vwap"]) & (df_ind["close"] < df_ind["or15_low"]) & (df_ind["ret_from_open"] <= -0.0050) & (df_ind["ret_2m"] >= 0.0010)) |
+                ((df_ind["ret_from_open"] <= -0.0020) & (df_ind["z_15"] >= 1.8) & (df_ind["ibs"] >= 0.75))
+            ).to_numpy(),
+            "s_ext": ((df_ind["close"] > df_ind["vwap"] * 1.005) & (df_ind["ret_15m"] > 0.0060)).to_numpy(),
+            "max_hold": 90, "sl": 0.0140, "pt": 0.0150,
+        },
+        {
+            "name": "5. 5 Lower Closes -> Exit Highest Close (10 Bars)",
+            "rule": "ENTRY: 5 consecutive lower closes; buy Next Bar's Open. EXIT: Close >= Highest Close of prior 10 bars or 15:55 ET.",
+            "l_ent": df_ind["down_5_streak"].to_numpy(),
+            "l_ext": (df_ind["close"] >= df_ind["highest_close_x"]).to_numpy(),
+            "max_hold": 390, "sl": 0.010, "pt": 0.015,
+        },
+        {
+            "name": "6. 3 Lower Closes Above VWAP -> Exit Highest Close",
+            "rule": "ENTRY: 3 consecutive lower closes while above VWAP. EXIT: Close >= Highest Close of prior 10 bars or VWAP - 1.5 SD.",
+            "l_ent": (df_ind["down_3_streak"] & (df_ind["close"] > df_ind["vwap"])).to_numpy(),
+            "l_ext": (df_ind["close"] >= df_ind["highest_close_x"]).to_numpy(),
+            "max_hold": 390, "sl": 0.010, "pt": 0.015,
+        },
+        {
+            "name": "7. Opening Range Breakout (15m) + Session VWAP Trend",
+            "rule": "LONG ENTRY: Close > ORB High, VWAP, and Volume > 1.25x MA. EXIT: Cross back through VWAP.",
+            "l_ent": ((df_ind["bar_time"] > "09:45") & (df_ind["close"] > df_ind["or15_high"]) & (df_ind["close"] > df_ind["vwap"])).to_numpy(),
+            "l_ext": (df_ind["close"] < df_ind["vwap"]).to_numpy(),
+            "max_hold": 390, "sl": 0.010, "pt": 0.015,
+        },
+        {
+            "name": "8. Session VWAP 2-SD Mean Reversion Band Bounce",
+            "rule": "LONG ENTRY: Close < VWAP - 2.0 SD. SHORT ENTRY: Close > VWAP + 2.0 SD. EXIT: Touch VWAP.",
+            "l_ent": (df_ind["close"] < (df_ind["vwap"] - 2.0 * df_ind["std_15"])).to_numpy(),
+            "l_ext": (df_ind["close"] >= df_ind["vwap"]).to_numpy(),
+            "max_hold": 120, "sl": 0.010, "pt": 0.010,
+        },
+        {
