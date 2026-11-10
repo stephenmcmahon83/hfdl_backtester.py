@@ -24,7 +24,7 @@ class HFDataClient:
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "HFDL-SemiHFT-Tournament/5.2"})
+        self.session.headers.update({"User-Agent": "HFDL-SemiHFT-Tournament/5.4"})
 
     def request_safe(
         self,
@@ -207,6 +207,8 @@ def prepare_and_audit_data(
             df[col] = df[col].fillna(df["close"])
         df["volume"] = df["volume"].fillna(0.0)
 
+    df["session_date"] = df.index.normalize()
+
     bt_first_ts = df.index.min() if not df.empty else None
     bt_last_ts = df.index.max() if not df.empty else None
     cal_years = max((bt_last_ts - bt_first_ts).days / 365.25, 1.0 / 252.0) if (bt_first_ts and bt_last_ts) else 0.0
@@ -236,15 +238,16 @@ def prepare_and_audit_data(
 # =====================================================================
 def precompute_indicators(df: pd.DataFrame, x_lookback: int = 10, orb_minutes: int = 15) -> pd.DataFrame:
     df = df.copy()
-    # Ensure session_date column exists securely
     if "session_date" not in df.columns:
         df["session_date"] = df.index.normalize()
 
     g = df.groupby("session_date")
 
     tp = (df["high"] + df["low"] + df["close"]) / 3.0
-    pv = tp * df["volume"]
-    cum_pv = pv.groupby("session_date").cumsum()
+    df["tp"] = tp
+    df["pv"] = tp * df["volume"]
+
+    cum_pv = g["pv"].cumsum()
     cum_vol = g["volume"].cumsum().replace(0, np.nan)
     df["vwap"] = (cum_pv / cum_vol).groupby("session_date").ffill().fillna(df["close"])
 
@@ -281,9 +284,9 @@ def precompute_indicators(df: pd.DataFrame, x_lookback: int = 10, orb_minutes: i
     prev_close = g["close"].shift(1)
     is_lower = df["close"] < prev_close
     is_higher = df["close"] > prev_close
-    df["down_5_streak"] = is_lower.groupby("session_date").transform(lambda s: s.rolling(5, min_periods=5).sum() == 5)
-    df["down_3_streak"] = is_lower.groupby("session_date").transform(lambda s: s.rolling(3, min_periods=3).sum() == 3)
-    df["up_5_streak"] = is_higher.groupby("session_date").transform(lambda s: s.rolling(5, min_periods=5).sum() == 5)
+    df["down_5_streak"] = is_lower.groupby(df["session_date"]).transform(lambda s: s.rolling(5, min_periods=5).sum() == 5)
+    df["down_3_streak"] = is_lower.groupby(df["session_date"]).transform(lambda s: s.rolling(3, min_periods=3).sum() == 3)
+    df["up_5_streak"] = is_higher.groupby(df["session_date"]).transform(lambda s: s.rolling(5, min_periods=5).sum() == 5)
 
     dirs = np.where(df["ret_1m"] > 0, 1, np.where(df["ret_1m"] < 0, -1, 0))
     dates = df["session_date"].values
