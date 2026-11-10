@@ -24,7 +24,7 @@ class HFDataClient:
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "HFDL-SemiHFT-Tournament/5.0"})
+        self.session.headers.update({"User-Agent": "HFDL-SemiHFT-Tournament/5.1"})
 
     def request_safe(
         self,
@@ -240,9 +240,9 @@ def precompute_indicators(df: pd.DataFrame, x_lookback: int = 10, orb_minutes: i
 
     tp = (df["high"] + df["low"] + df["close"]) / 3.0
     pv = tp * df["volume"]
-    cum_pv = pv.groupby(df["session_date"]).cumsum()
+    cum_pv = pv.groupby("session_date").cumsum()
     cum_vol = g["volume"].cumsum().replace(0, np.nan)
-    df["vwap"] = (cum_pv / cum_vol).groupby(df["session_date"]).ffill().fillna(df["close"])
+    df["vwap"] = (cum_pv / cum_vol).groupby("session_date").ffill().fillna(df["close"])
 
     # Returns & Z-Score
     df["ret_1m"] = g["close"].pct_change(1)
@@ -277,9 +277,9 @@ def precompute_indicators(df: pd.DataFrame, x_lookback: int = 10, orb_minutes: i
     prev_close = g["close"].shift(1)
     is_lower = df["close"] < prev_close
     is_higher = df["close"] > prev_close
-    df["down_5_streak"] = is_lower.groupby(df["session_date"]).transform(lambda s: s.rolling(5, min_periods=5).sum() == 5)
-    df["down_3_streak"] = is_lower.groupby(df["session_date"]).transform(lambda s: s.rolling(3, min_periods=3).sum() == 3)
-    df["up_5_streak"] = is_higher.groupby(df["session_date"]).transform(lambda s: s.rolling(5, min_periods=5).sum() == 5)
+    df["down_5_streak"] = is_lower.groupby("session_date").transform(lambda s: s.rolling(5, min_periods=5).sum() == 5)
+    df["down_3_streak"] = is_lower.groupby("session_date").transform(lambda s: s.rolling(3, min_periods=3).sum() == 3)
+    df["up_5_streak"] = is_higher.groupby("session_date").transform(lambda s: s.rolling(5, min_periods=5).sum() == 5)
 
     dirs = np.where(df["ret_1m"] > 0, 1, np.where(df["ret_1m"] < 0, -1, 0))
     dates = df["session_date"].values
@@ -468,56 +468,4 @@ def run_all_15_strategies(
                 ((df_ind["close"] > df_ind["vwap"]) & (df_ind["ret_from_open"] >= 0.0020) & (df_ind["ret_15m"] >= 0.0015) & (df_ind["ret_2m"] <= -0.0004) & (df_ind["ibs"] <= 0.25)) |
                 ((df_ind["close"] > df_ind["vwap"]) & (df_ind["close"] > df_ind["or15_high"]) & (df_ind["ret_15m"] >= 0.0040))
             ).to_numpy(),
-            "l_ext": ((df_ind["close"] < df_ind["vwap"] * 0.9970)).to_numpy(),
-            "s_ent": ((df_ind["close"] < df_ind["vwap"]) & (df_ind["close"] < df_ind["or15_low"]) & (df_ind["ret_from_open"] <= -0.0040) & (df_ind["ibs"] >= 0.75)).to_numpy(),
-            "s_ext": ((df_ind["close"] > df_ind["vwap"] * 1.0030)).to_numpy(),
-            "max_hold": 45, "sl": 0.0055, "pt": 0.0045,
-        },
-        {
-            "name": "3. QQQ Core Sub-Signal 1 Only (VWAP + 3-Bar Dip Long)",
-            "rule": "LONG ENTRY: Close > VWAP, Return from open >= +0.15%, and 3 consecutive down closes or 3m return <= -0.10% with IBS <= 0.15. PT +0.75%, SL -0.80%.",
-            "l_ent": ((df_ind["close"] > df_ind["vwap"]) & (df_ind["ret_from_open"] >= 0.0015) & ((df_ind["down_3_streak"]) | ((df_ind["ret_3m"] <= -0.0010) & (df_ind["ibs"] <= 0.15)))).to_numpy(),
-            "l_ext": ((df_ind["close"] < df_ind["vwap"] * 0.9970)).to_numpy(),
-            "max_hold": 120, "sl": 0.0080, "pt": 0.0075,
-        },
-        {
-            "name": "4. VXX Volatility Crush & Cascade Engine",
-            "rule": "LONG ENTRY: Volatility breakout ignition. SHORT ENTRY: OR15/VWAP breakdown + bounce fade or Z-score pop >= 1.8. PT +1.50%, SL -1.40%, 90m hold.",
-            "l_ent": ((df_ind["close"] > df_ind["vwap"]) & (df_ind["close"] > df_ind["or15_high"]) & (df_ind["ret_from_open"] >= 0.0120) & (df_ind["ret_15m"] >= 0.0080) & (df_ind["ret_2m"] <= -0.0010)).to_numpy(),
-            "l_ext": ((df_ind["close"] < df_ind["vwap"] * 0.995)).to_numpy(),
-            "s_ent": (
-                ((df_ind["close"] < df_ind["vwap"]) & (df_ind["close"] < df_ind["or15_low"]) & (df_ind["ret_from_open"] <= -0.0050) & (df_ind["ret_2m"] >= 0.0010)) |
-                ((df_ind["ret_from_open"] <= -0.0020) & (df_ind["z_15"] >= 1.8) & (df_ind["ibs"] >= 0.75))
-            ).to_numpy(),
-            "s_ext": ((df_ind["close"] > df_ind["vwap"] * 1.005) & (df_ind["ret_15m"] > 0.0060)).to_numpy(),
-            "max_hold": 90, "sl": 0.0140, "pt": 0.0150,
-        },
-        {
-            "name": "5. 5 Lower Closes -> Exit Highest Close (10 Bars)",
-            "rule": "ENTRY: 5 consecutive lower closes; buy Next Bar's Open. EXIT: Close >= Highest Close of prior 10 bars or 15:55 ET.",
-            "l_ent": df_ind["down_5_streak"].to_numpy(),
-            "l_ext": (df_ind["close"] >= df_ind["highest_close_x"]).to_numpy(),
-            "max_hold": 390, "sl": 0.010, "pt": 0.015,
-        },
-        {
-            "name": "6. 3 Lower Closes Above VWAP -> Exit Highest Close",
-            "rule": "ENTRY: 3 consecutive lower closes while above VWAP. EXIT: Close >= Highest Close of prior 10 bars or VWAP - 1.5 SD.",
-            "l_ent": (df_ind["down_3_streak"] & (df_ind["close"] > df_ind["vwap"])).to_numpy(),
-            "l_ext": (df_ind["close"] >= df_ind["highest_close_x"]).to_numpy(),
-            "max_hold": 390, "sl": 0.010, "pt": 0.015,
-        },
-        {
-            "name": "7. Opening Range Breakout (15m) + Session VWAP Trend",
-            "rule": "LONG ENTRY: Close > ORB High, VWAP, and Volume > 1.25x MA. EXIT: Cross back through VWAP.",
-            "l_ent": ((df_ind["bar_time"] > "09:45") & (df_ind["close"] > df_ind["or15_high"]) & (df_ind["close"] > df_ind["vwap"])).to_numpy(),
-            "l_ext": (df_ind["close"] < df_ind["vwap"]).to_numpy(),
-            "max_hold": 390, "sl": 0.010, "pt": 0.015,
-        },
-        {
-            "name": "8. Session VWAP 2-SD Mean Reversion Band Bounce",
-            "rule": "LONG ENTRY: Close < VWAP - 2.0 SD. SHORT ENTRY: Close > VWAP + 2.0 SD. EXIT: Touch VWAP.",
-            "l_ent": (df_ind["close"] < (df_ind["vwap"] - 2.0 * df_ind["std_15"])).to_numpy(),
-            "l_ext": (df_ind["close"] >= df_ind["vwap"]).to_numpy(),
-            "max_hold": 120, "sl": 0.010, "pt": 0.010,
-        },
-        {
+            "l_ext": ((df_
